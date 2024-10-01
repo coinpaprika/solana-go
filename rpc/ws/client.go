@@ -19,6 +19,7 @@ package ws
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -32,17 +33,28 @@ import (
 	"go.uber.org/zap"
 )
 
+var errDead = errors.New("connection lost")
+
+type reconnectFunc func(context.Context) (*websocket.Conn, error)
+
 type result interface{}
 
-type Client struct {
-	rpcURL                  string
-	conn                    *websocket.Conn
-	connCtx                 context.Context
-	connCtxCancel           context.CancelFunc
-	lock                    sync.RWMutex
+type connSubscriptions struct {
 	subscriptionByRequestID map[uint64]*Subscription
 	subscriptionByWSSubID   map[uint64]*Subscription
-	reconnectOnErr          bool
+}
+
+type Client struct {
+	rpcURL string
+	conn   *websocket.Conn
+	lock   sync.RWMutex
+
+	connToSubscriptions map[*websocket.Conn]*connSubscriptions
+
+	reconnectFunc reconnectFunc
+	pongReceived  chan struct{}
+	closed        chan struct{}
+	msgChan       chan []byte
 }
 
 const (
@@ -63,11 +75,13 @@ func Connect(ctx context.Context, rpcEndpoint string) (c *Client, err error) {
 // endpoint with a http header if available The http header can be helpful to
 // pass basic authentication params as prescribed
 // ref https://github.com/gorilla/websocket/issues/209
-func ConnectWithOptions(ctx context.Context, rpcEndpoint string, opt *Options) (c *Client, err error) {
-	c = &Client{
-		rpcURL:                  rpcEndpoint,
-		subscriptionByRequestID: map[uint64]*Subscription{},
-		subscriptionByWSSubID:   map[uint64]*Subscription{},
+func ConnectWithOptions(ctx context.Context, rpcEndpoint string, opt *Options) (*Client, error) {
+	c := &Client{
+		rpcURL:              rpcEndpoint,
+		connToSubscriptions: make(map[*websocket.Conn]*connSubscriptions),
+		pongReceived:        make(chan struct{}),
+		closed:              make(chan struct{}),
+		msgChan:             make(chan []byte),
 	}
 
 	dialer := &websocket.Dialer{
@@ -84,64 +98,154 @@ func ConnectWithOptions(ctx context.Context, rpcEndpoint string, opt *Options) (
 	if opt != nil && opt.HttpHeader != nil && len(opt.HttpHeader) > 0 {
 		httpHeader = opt.HttpHeader
 	}
-	var resp *http.Response
-	c.conn, resp, err = dialer.DialContext(ctx, rpcEndpoint, httpHeader)
-	if err != nil {
-		if resp != nil {
-			body, _ := io.ReadAll(resp.Body)
-			err = fmt.Errorf("new ws client: dial: %w, status: %s, body: %q", err, resp.Status, string(body))
-		} else {
-			err = fmt.Errorf("new ws client: dial: %w", err)
-		}
-		return nil, err
-	}
 
-	c.connCtx, c.connCtxCancel = context.WithCancel(context.Background())
-	go func() {
-		c.conn.SetReadDeadline(time.Now().Add(pongWait))
-		c.conn.SetPongHandler(func(string) error { c.conn.SetReadDeadline(time.Now().Add(pongWait)); return nil })
-		ticker := time.NewTicker(pingPeriod)
-		for {
-			select {
-			case <-c.connCtx.Done():
-				return
-			case <-ticker.C:
-				c.sendPing()
+	connect := func(ctx context.Context) (*websocket.Conn, error) {
+		header := httpHeader.Clone()
+		conn, resp, err := dialer.DialContext(ctx, rpcEndpoint, header)
+		if err != nil {
+			if resp != nil {
+				body, _ := io.ReadAll(resp.Body)
+				err = fmt.Errorf("new ws client: dial: %w, status: %s, body: %q", err, resp.Status, string(body))
+			} else {
+				err = fmt.Errorf("new ws client: dial: %w", err)
 			}
 		}
-	}()
-	go c.receiveMessages()
+		return conn, err
+	}
+
+	c.reconnectFunc = connect
+	if err := c.connect(ctx); err != nil {
+		return nil, err
+	}
+	go c.pingLoop()
+	go c.msgLoop()
 	return c, nil
 }
 
-func (c *Client) sendPing() {
+func (c *Client) write(ctx context.Context, data []byte, retry bool) error {
+	if c.conn == nil {
+		// The previous write failed. Try to establish a new connection.
+		if err := c.connectNoLock(ctx); err != nil {
+			return err
+		}
+	}
+
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		deadline = time.Now().Add(writeWait)
+	}
+	zlog.Debug("writing data to conn", zap.String("data", string(data)))
+	c.conn.SetWriteDeadline(deadline)
+	err := c.conn.WriteMessage(websocket.TextMessage, data)
+	if err != nil {
+		c.conn = nil
+		if !retry {
+			return c.write(ctx, data, true)
+		}
+	}
+	return err
+}
+
+func (c *Client) connect(ctx context.Context) error {
+	if c.reconnectFunc == nil {
+		return errDead
+	}
+
 	c.lock.Lock()
 	defer c.lock.Unlock()
+	return c.connectNoLock(ctx)
+}
 
-	c.conn.SetWriteDeadline(time.Now().Add(writeWait))
-	if err := c.conn.WriteMessage(websocket.PingMessage, []byte{}); err != nil {
-		return
+func (c *Client) connectNoLock(ctx context.Context) error {
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel func()
+		ctx, cancel = context.WithTimeout(ctx, writeWait)
+		defer cancel()
+	}
+
+	conn, err := c.reconnectFunc(ctx)
+	if err != nil {
+		zlog.Debug("RPC client reconnect failed", zap.Error(err))
+		return err
+	} else {
+		zlog.Debug("RPC client reconnected")
+	}
+
+	c.connToSubscriptions[conn] = &connSubscriptions{
+		subscriptionByRequestID: make(map[uint64]*Subscription),
+		subscriptionByWSSubID:   make(map[uint64]*Subscription),
+	}
+	conn.SetPongHandler(func(appData string) error {
+		select {
+		case c.pongReceived <- struct{}{}:
+		case <-c.closed:
+		}
+		return nil
+	})
+	c.conn = conn
+
+	go func() {
+		for {
+			_, msg, err := conn.ReadMessage()
+			if err != nil {
+				// Close all subscriptions associated with this connection.
+				// Two scenarios can happen here:
+				// 1. Retry logic executed earlier, and a new connection has already been established.
+				//    This means we need to clean up resources linked to the old connection.
+				// 2. Retry logic has not been executed yet, so this cleanup will ensure
+				//    all resources tied to this connection are properly released before retrying.
+				c.closeAllSubscription(conn, err)
+				return
+			}
+			select {
+			case <-c.closed:
+			case c.msgChan <- msg:
+			}
+		}
+	}()
+
+	return nil
+}
+
+func (wc *Client) pingLoop() {
+	var pingTimer = time.NewTimer(pingPeriod)
+	defer pingTimer.Stop()
+
+	for {
+		select {
+		case <-wc.closed:
+			return
+		case <-pingTimer.C:
+			wc.lock.Lock()
+			wc.conn.SetWriteDeadline(time.Now().Add(writeWait))
+			wc.conn.WriteMessage(websocket.PingMessage, nil)
+			wc.conn.SetReadDeadline(time.Now().Add(pongWait))
+			wc.lock.Unlock()
+			pingTimer.Reset(30 * time.Second)
+		case <-wc.pongReceived:
+			wc.conn.SetReadDeadline(time.Time{})
+		}
 	}
 }
 
 func (c *Client) Close() {
 	c.lock.Lock()
 	defer c.lock.Unlock()
-	c.connCtxCancel()
+	close(c.closed)
 	c.conn.Close()
 }
 
-func (c *Client) receiveMessages() {
+// TODO remove
+func (c *Client) Close2() {
+	c.conn.Close()
+}
+
+func (c *Client) msgLoop() {
 	for {
 		select {
-		case <-c.connCtx.Done():
+		case <-c.closed:
 			return
-		default:
-			_, message, err := c.conn.ReadMessage()
-			if err != nil {
-				c.closeAllSubscription(err)
-				return
-			}
+		case message := <-c.msgChan:
 			c.handleMessage(message)
 		}
 	}
@@ -194,7 +298,12 @@ func (c *Client) handleNewSubscriptionMessage(requestID, subID uint64) {
 		)
 	}
 
-	callBack, found := c.subscriptionByRequestID[requestID]
+	subscriptions, ok := c.connToSubscriptions[c.conn]
+	if !ok {
+		return
+	}
+
+	callBack, found := subscriptions.subscriptionByRequestID[requestID]
 	if !found {
 		zlog.Error("cannot find websocket message handler for a new stream.... this should not happen",
 			zap.Uint64("request_id", requestID),
@@ -203,12 +312,12 @@ func (c *Client) handleNewSubscriptionMessage(requestID, subID uint64) {
 		return
 	}
 	callBack.subID = subID
-	c.subscriptionByWSSubID[subID] = callBack
+	subscriptions.subscriptionByWSSubID[subID] = callBack
 
 	zlog.Debug("registered ws subscription",
 		zap.Uint64("subscription_id", subID),
 		zap.Uint64("request_id", requestID),
-		zap.Int("subscription_count", len(c.subscriptionByWSSubID)),
+		zap.Int("subscription_count", len(subscriptions.subscriptionByWSSubID)),
 	)
 	return
 }
@@ -221,10 +330,15 @@ func (c *Client) handleSubscriptionMessage(subID uint64, message []byte) {
 	}
 
 	c.lock.RLock()
-	sub, found := c.subscriptionByWSSubID[subID]
+	subscriptions, ok := c.connToSubscriptions[c.conn]
+	if !ok {
+		return
+	}
+	sub, found := subscriptions.subscriptionByWSSubID[subID]
 	c.lock.RUnlock()
 	if !found {
-		zlog.Warn("unable to find subscription for ws message", zap.Uint64("subscription_id", subID))
+		// Origin of the message might be of cleaned up connection.
+		zlog.Info("unable to find subscription for ws message", zap.Uint64("subscription_id", subID))
 		return
 	}
 
@@ -252,23 +366,30 @@ func (c *Client) handleSubscriptionMessage(subID uint64, message []byte) {
 	return
 }
 
-func (c *Client) closeAllSubscription(err error) {
+func (c *Client) closeAllSubscription(conn *websocket.Conn, err error) {
 	c.lock.Lock()
 	defer c.lock.Unlock()
-
-	for _, sub := range c.subscriptionByRequestID {
+	subs, ok := c.connToSubscriptions[conn]
+	if !ok {
+		return
+	}
+	for _, sub := range subs.subscriptionByRequestID {
 		sub.err <- err
 	}
-
-	c.subscriptionByRequestID = map[uint64]*Subscription{}
-	c.subscriptionByWSSubID = map[uint64]*Subscription{}
+	subs.subscriptionByRequestID = nil
+	subs.subscriptionByWSSubID = nil
+	delete(c.connToSubscriptions, conn)
 }
 
 func (c *Client) closeSubscription(reqID uint64, err error) {
 	c.lock.Lock()
 	defer c.lock.Unlock()
+	subs, ok := c.connToSubscriptions[c.conn]
+	if !ok {
+		return
+	}
 
-	sub, found := c.subscriptionByRequestID[reqID]
+	sub, found := subs.subscriptionByRequestID[reqID]
 	if !found {
 		return
 	}
@@ -282,8 +403,8 @@ func (c *Client) closeSubscription(reqID uint64, err error) {
 		)
 	}
 
-	delete(c.subscriptionByRequestID, sub.req.ID)
-	delete(c.subscriptionByWSSubID, sub.subID)
+	delete(subs.subscriptionByRequestID, sub.req.ID)
+	delete(subs.subscriptionByWSSubID, sub.subID)
 }
 
 func (c *Client) unsubscribe(subID uint64, method string) error {
@@ -292,9 +413,9 @@ func (c *Client) unsubscribe(subID uint64, method string) error {
 	if err != nil {
 		return fmt.Errorf("unable to encode unsubscription message for subID %d and method %s", subID, method)
 	}
-
-	c.conn.SetWriteDeadline(time.Now().Add(writeWait))
-	err = c.conn.WriteMessage(websocket.TextMessage, data)
+	ctx, timeout := context.WithTimeout(context.Background(), writeWait)
+	defer timeout()
+	err = c.write(ctx, data, false)
 	if err != nil {
 		return fmt.Errorf("unable to send unsubscription message for subID %d and method %s", subID, method)
 	}
@@ -326,15 +447,17 @@ func (c *Client) subscribe(
 		decoderFunc,
 	)
 
-	c.subscriptionByRequestID[req.ID] = sub
-	zlog.Info("added new subscription to websocket client", zap.Int("count", len(c.subscriptionByRequestID)))
-
-	zlog.Debug("writing data to conn", zap.String("data", string(data)))
-	c.conn.SetWriteDeadline(time.Now().Add(writeWait))
-	err = c.conn.WriteMessage(websocket.TextMessage, data)
+	zlog.Info("added new subscription to websocket client", zap.Int("count", len(c.connToSubscriptions)))
+	ctx, cancel := context.WithTimeout(context.Background(), writeWait)
+	defer cancel()
+	err = c.write(ctx, data, false)
 	if err != nil {
 		return nil, fmt.Errorf("unable to write request: %w", err)
 	}
+	// Safe to move after the write, as the lock will block reads.
+	// This ensures the subscription ID is retained during reconnection.
+	subs := c.connToSubscriptions[c.conn]
+	subs.subscriptionByRequestID[req.ID] = sub
 
 	return sub, nil
 }
