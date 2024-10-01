@@ -123,7 +123,7 @@ func ConnectWithOptions(ctx context.Context, rpcEndpoint string, opt *Options) (
 }
 
 func (c *Client) write(ctx context.Context, data []byte, retry bool) error {
-	if c.conn == nil {
+	if retry {
 		// The previous write failed. Try to establish a new connection.
 		if err := c.connectNoLock(ctx); err != nil {
 			return err
@@ -138,7 +138,6 @@ func (c *Client) write(ctx context.Context, data []byte, retry bool) error {
 	c.conn.SetWriteDeadline(deadline)
 	err := c.conn.WriteMessage(websocket.TextMessage, data)
 	if err != nil {
-		c.conn = nil
 		if !retry {
 			return c.write(ctx, data, true)
 		}
