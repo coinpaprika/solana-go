@@ -236,11 +236,6 @@ func (c *Client) Close() {
 	c.conn.Close()
 }
 
-// TODO remove
-func (c *Client) Close2() {
-	c.conn.Close()
-}
-
 func (c *Client) msgLoop() {
 	for {
 		select {
