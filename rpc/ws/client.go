@@ -118,7 +118,9 @@ func ConnectWithOptions(ctx context.Context, rpcEndpoint string, opt *Options) (
 		return nil, err
 	}
 	go c.pingLoop()
-	go c.msgLoop()
+	for i := 0; i < 8; i++ {
+		go c.msgLoop()
+	}
 	return c, nil
 }
 
