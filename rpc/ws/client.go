@@ -33,8 +33,6 @@ import (
 	"go.uber.org/zap"
 )
 
-var errDead = errors.New("connection lost")
-
 type reconnectFunc func(context.Context) (*websocket.Conn, error)
 
 type result interface{}
@@ -99,7 +97,7 @@ func ConnectWithOptions(ctx context.Context, rpcEndpoint string, opt *Options) (
 		httpHeader = opt.HttpHeader
 	}
 
-	connect := func(ctx context.Context) (*websocket.Conn, error) {
+	c.reconnectFunc = func(ctx context.Context) (*websocket.Conn, error) {
 		header := httpHeader.Clone()
 		conn, resp, err := dialer.DialContext(ctx, rpcEndpoint, header)
 		if err != nil {
@@ -113,7 +111,6 @@ func ConnectWithOptions(ctx context.Context, rpcEndpoint string, opt *Options) (
 		return conn, err
 	}
 
-	c.reconnectFunc = connect
 	if err := c.connect(ctx); err != nil {
 		return nil, err
 	}
@@ -124,11 +121,14 @@ func ConnectWithOptions(ctx context.Context, rpcEndpoint string, opt *Options) (
 	return c, nil
 }
 
+// write sends a message to the current connection.
+// If retry is false, it attempts one reconnection.
+// It assumes the lock is held before being called.
 func (c *Client) write(ctx context.Context, data []byte, retry bool) error {
 	if retry {
 		// The previous write failed. Try to establish a new connection.
-		if err := c.connectNoLock(ctx); err != nil {
-			return err
+		if err := c.connect(ctx); err != nil {
+			return fmt.Errorf("reconnect: %w", err)
 		}
 	}
 
@@ -143,21 +143,14 @@ func (c *Client) write(ctx context.Context, data []byte, retry bool) error {
 		if !retry {
 			return c.write(ctx, data, true)
 		}
+		return err
 	}
-	return err
+	return nil
 }
 
+// connect establishes a connection to the remote server.
+// It assumes the lock is held before being called.
 func (c *Client) connect(ctx context.Context) error {
-	if c.reconnectFunc == nil {
-		return errDead
-	}
-
-	c.lock.Lock()
-	defer c.lock.Unlock()
-	return c.connectNoLock(ctx)
-}
-
-func (c *Client) connectNoLock(ctx context.Context) error {
 	if _, ok := ctx.Deadline(); !ok {
 		var cancel func()
 		ctx, cancel = context.WithTimeout(ctx, writeWait)
@@ -168,10 +161,13 @@ func (c *Client) connectNoLock(ctx context.Context) error {
 	if err != nil {
 		zlog.Debug("RPC client reconnect failed", zap.Error(err))
 		return err
-	} else {
-		zlog.Debug("RPC client reconnected")
+	}
+	if conn == nil {
+		return errors.New("nil connection established")
 	}
 
+	zlog.Debug("RPC client reconnected")
+	c.conn = conn
 	c.connToSubscriptions[conn] = &connSubscriptions{
 		subscriptionByRequestID: make(map[uint64]*Subscription),
 		subscriptionByWSSubID:   make(map[uint64]*Subscription),
@@ -183,7 +179,6 @@ func (c *Client) connectNoLock(ctx context.Context) error {
 		}
 		return nil
 	})
-	c.conn = conn
 
 	go func() {
 		for {
@@ -328,6 +323,7 @@ func (c *Client) handleSubscriptionMessage(subID uint64, message []byte) {
 	c.lock.RLock()
 	subscriptions, ok := c.connToSubscriptions[c.conn]
 	if !ok {
+		c.lock.RUnlock()
 		return
 	}
 	sub, found := subscriptions.subscriptionByWSSubID[subID]
@@ -372,6 +368,7 @@ func (c *Client) closeAllSubscription(conn *websocket.Conn, err error) {
 	for _, sub := range subs.subscriptionByRequestID {
 		sub.err <- err
 	}
+
 	subs.subscriptionByRequestID = nil
 	subs.subscriptionByWSSubID = nil
 	delete(c.connToSubscriptions, conn)
@@ -407,13 +404,13 @@ func (c *Client) unsubscribe(subID uint64, method string) error {
 	req := newRequest([]interface{}{subID}, method, nil)
 	data, err := req.encode()
 	if err != nil {
-		return fmt.Errorf("unable to encode unsubscription message for subID %d and method %s", subID, method)
+		return fmt.Errorf("unable to encode unsubscribe message for subID %d and method %s", subID, method)
 	}
-	ctx, timeout := context.WithTimeout(context.Background(), writeWait)
-	defer timeout()
+	ctx, cancel := context.WithTimeout(context.Background(), writeWait)
+	defer cancel()
 	err = c.write(ctx, data, false)
 	if err != nil {
-		return fmt.Errorf("unable to send unsubscription message for subID %d and method %s", subID, method)
+		return fmt.Errorf("unable to send unsubscribe message for subID %d and method %s", subID, method)
 	}
 	return nil
 }
@@ -425,14 +422,14 @@ func (c *Client) subscribe(
 	unsubscribeMethod string,
 	decoderFunc decoderFunc,
 ) (*Subscription, error) {
-	c.lock.Lock()
-	defer c.lock.Unlock()
-
 	req := newRequest(params, subscriptionMethod, conf)
 	data, err := req.encode()
 	if err != nil {
-		return nil, fmt.Errorf("subscribe: unable to encode subsciption request: %w", err)
+		return nil, fmt.Errorf("subscribe: unable to encode subscription request: %w", err)
 	}
+
+	c.lock.Lock()
+	defer c.lock.Unlock()
 
 	sub := newSubscription(
 		req,
@@ -443,7 +440,6 @@ func (c *Client) subscribe(
 		decoderFunc,
 	)
 
-	zlog.Info("added new subscription to websocket client", zap.Int("count", len(c.connToSubscriptions)))
 	ctx, cancel := context.WithTimeout(context.Background(), writeWait)
 	defer cancel()
 	err = c.write(ctx, data, false)
@@ -452,8 +448,15 @@ func (c *Client) subscribe(
 	}
 	// Safe to move after the write, as the lock will block reads.
 	// This ensures the subscription ID is retained during reconnection.
-	subs := c.connToSubscriptions[c.conn]
+	subs, ok := c.connToSubscriptions[c.conn]
+	if !ok {
+		return nil, errors.New("subscriptions for current connection not found")
+	}
+	if subs == nil || subs.subscriptionByRequestID == nil || subs.subscriptionByWSSubID == nil {
+		return nil, errors.New("nil subscriptions for current connection")
+	}
 	subs.subscriptionByRequestID[req.ID] = sub
+	zlog.Info("added new subscription to websocket client", zap.Int("count", len(subs.subscriptionByRequestID)))
 
 	return sub, nil
 }
@@ -500,6 +503,10 @@ func decodeResponseFromMessage(r []byte, reply interface{}) (err error) {
 	}
 
 	if c.Params == nil {
+		return json2.ErrNullResult
+	}
+
+	if c.Params.Result == nil {
 		return json2.ErrNullResult
 	}
 
