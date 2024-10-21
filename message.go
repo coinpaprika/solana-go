@@ -115,6 +115,10 @@ type Message struct {
 	resolved bool // if true, the lookups have been resolved, and the `AccountKeys` slice contains all the accounts (static + dynamic).
 }
 
+func (mx *Message) ResetAddressTables() {
+	mx.addressTables = nil
+}
+
 // SetAddressTables sets the actual address tables used by this message.
 // Use `mx.GetAddressTableLookups().GetTableIDs()` to get the list of all address table IDs.
 // NOTE: you can call this once.
