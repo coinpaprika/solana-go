@@ -619,6 +619,13 @@ type InstructionInfoEnvelope struct {
 	asInstructionInfo *InstructionInfo
 }
 
+func (i InstructionInfoEnvelope) Data() any {
+	if i.asInstructionInfo != nil {
+		return i.asInstructionInfo
+	}
+	return i.asString
+}
+
 type InstructionInfo struct {
 	Info            map[string]any `json:"info"`
 	InstructionType string         `json:"type"`
