@@ -65,8 +65,11 @@ type response struct {
 }
 
 type params struct {
-	Result       *stdjson.RawMessage `json:"result"`
-	Subscription int                 `json:"subscription"`
+	Result *stdjson.RawMessage `json:"result"`
+	// Subscription is the subscription ID. Using json.Number to handle potential
+	// integer values larger than int64, as specified by the Solana RPC docs.
+	// ref: https://solana.com/docs/rpc/websocket/slotsubscribe
+	Subscription stdjson.Number `json:"subscription"`
 }
 
 type Options struct {
