@@ -219,13 +219,6 @@ type GetParsedBlockResult struct {
 	// Present if "full" transaction details are requested.
 	Transactions []ParsedTransactionWithMeta `json:"transactions"`
 
-	// Present if "signatures" are requested for transaction details;
-	// an array of signatures, corresponding to the transaction order in the block.
-	Signatures []solana.Signature `json:"signatures"`
-
-	// Present if rewards are requested.
-	Rewards []BlockReward `json:"rewards"`
-
 	// Estimated production time, as Unix timestamp (seconds since the Unix epoch).
 	// Nil if not available.
 	BlockTime *solana.UnixTimeSeconds `json:"blockTime"`
@@ -233,9 +226,7 @@ type GetParsedBlockResult struct {
 	// The number of blocks beneath this block.
 	BlockHeight *uint64 `json:"blockHeight"`
 
-	// The number of reward partitions.
-	// Present for the first block in the epoch otherwise Nil.
-	NumRewardPartitions *uint64 `json:"numRewardPartitions"`
+	// signatures, rewards, and numRewardPartitions are omitted to avoid unused allocations.
 }
 
 type ParsedTransactionWithMeta struct {
