@@ -125,8 +125,9 @@ func benchFixtures() []benchFixture {
 					"params": []any{
 						slot,
 						map[string]any{
-							"encoding":                       "jsonParsed",
-							"maxSupportedTransactionVersion": 0,
+							"encoding": "jsonParsed",
+							// Mainnet requires version 1 for blocks with modern transactions.
+							"maxSupportedTransactionVersion": 1,
 							"rewards":                        false,
 							"transactionDetails":             "full",
 						},
