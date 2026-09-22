@@ -564,19 +564,7 @@ type ParsedTransactionMeta struct {
 	// or omitted if token balance recording was not yet enabled during this transaction
 	PostTokenBalances []TokenBalance `json:"postTokenBalances"`
 
-	// Array of string log messages or omitted if log message
-	// recording was not yet enabled during this transaction
-	LogMessages []string `json:"logMessages"`
-
-	// DEPRECATED: Transaction status.
-	Status DeprecatedTransactionMetaStatus `json:"status"`
-
-	Rewards []BlockReward `json:"rewards"`
-
-	LoadedAddresses LoadedAddresses `json:"loadedAddresses"`
-
-	ReturnData ReturnData `json:"returnData"`
-
+	// Unread fields like logMessages, status, rewards, and returnData are omitted to save allocations.
 	ComputeUnitsConsumed *uint64 `json:"computeUnitsConsumed"`
 
 	// The cost the block cost model charged this transaction against the block
@@ -596,22 +584,22 @@ type ParsedMessageAccount struct {
 }
 
 type ParsedMessage struct {
-	AccountKeys     []ParsedMessageAccount `json:"accountKeys"`
-	Instructions    []*ParsedInstruction   `json:"instructions"`
-	RecentBlockHash string                 `json:"recentBlockhash"`
+	AccountKeys  []ParsedMessageAccount `json:"accountKeys"`
+	Instructions []*ParsedInstruction   `json:"instructions"`
 
-	// Inline compute budget configuration; only present for v1 (SIMD-0385)
-	// transactions.
+	// Inline compute budget configuration for v1 transactions.
 	TransactionConfig *solana.TransactionConfig `json:"transactionConfig,omitempty"`
+
+	// recentBlockhash is omitted to avoid allocations.
 }
 
 type ParsedInstruction struct {
-	Program     string                   `json:"program,omitempty"`
-	ProgramId   solana.PublicKey         `json:"programId,omitempty"`
-	Parsed      *InstructionInfoEnvelope `json:"parsed,omitempty"`
-	Data        solana.Base58            `json:"data,omitempty"`
-	Accounts    []solana.PublicKey       `json:"accounts,omitempty"`
-	StackHeight int64                    `json:"stackHeight"`
+	ProgramId solana.PublicKey         `json:"programId,omitempty"`
+	Parsed    *InstructionInfoEnvelope `json:"parsed,omitempty"`
+	Data      solana.Base58            `json:"data,omitempty"`
+	Accounts  []solana.PublicKey       `json:"accounts,omitempty"`
+
+	// program and stackHeight are omitted because they are unused.
 }
 
 type InstructionInfoEnvelope struct {

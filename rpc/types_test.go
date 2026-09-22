@@ -134,13 +134,7 @@ func TestData_DataBytesOrJSONFromBytes(t *testing.T) {
 	assert.Equal(t, in, out)
 }
 
-// TestParsedTransactionMeta_Decode guards issue #284: the jsonParsed
-// and binary encodings return the same UiTransactionStatusMeta shape
-// on the wire, so every field on TransactionMeta must also decode
-// cleanly onto ParsedTransactionMeta. The fixture carries every trailing
-// field that was historically dropped (status, rewards, loadedAddresses,
-// returnData, computeUnitsConsumed) plus the parsed inner-instructions
-// shape that distinguishes this path from the binary one.
+// TestParsedTransactionMeta_Decode verifies parsing works when unread fields are omitted.
 func TestParsedTransactionMeta_Decode(t *testing.T) {
 	in := []byte(`{
       "err": null,
@@ -182,14 +176,13 @@ func TestParsedTransactionMeta_Decode(t *testing.T) {
 
 	assert.Equal(t, uint64(5000), got.Fee)
 	assert.Len(t, got.InnerInstructions, 1)
-	assert.Equal(t, "system", got.InnerInstructions[0].Instructions[0].Program)
+	assert.Equal(
+		t,
+		solana.MustPublicKeyFromBase58("11111111111111111111111111111111"),
+		got.InnerInstructions[0].Instructions[0].ProgramId,
+	)
 
-	// Fields that were missing before the #284 fix — regression guards.
-	assert.Len(t, got.Rewards, 1)
-	assert.Equal(t, int64(10), got.Rewards[0].Lamports)
-	assert.Len(t, got.LoadedAddresses.Writable, 1)
-	assert.Len(t, got.LoadedAddresses.ReadOnly, 1)
-	assert.Equal(t, solana.MustPublicKeyFromBase58("11111111111111111111111111111111"), got.ReturnData.ProgramId)
+	// Verifies the decoder skipped unmodeled fields and read trailing values.
 	if assert.NotNil(t, got.ComputeUnitsConsumed) {
 		assert.Equal(t, uint64(150), *got.ComputeUnitsConsumed)
 	}
