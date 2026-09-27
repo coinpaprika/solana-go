@@ -827,3 +827,35 @@ func FuzzPublicKey_UnmarshalJSON(f *testing.F) {
 		}
 	})
 }
+
+// TestPublicKey_UnmarshalJSONDoesNotAliasInput pins the invariant that makes
+// the zero-copy fast path safe: nothing returned by UnmarshalJSON may keep
+// pointing into the caller's buffer, which json.Decoder reuses. A returned
+// error (built from the view) must survive the buffer being overwritten.
+func TestPublicKey_UnmarshalJSONDoesNotAliasInput(t *testing.T) {
+	for _, in := range []string{
+		`"SerkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"`,  // wrong length
+		`"0OIlSerumkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623"`, // outside the alphabet
+	} {
+		t.Run(in, func(t *testing.T) {
+			data := []byte(in)
+			var pk PublicKey
+			err := pk.UnmarshalJSON(data)
+			require.Error(t, err)
+			msg := err.Error()
+
+			for i := range data {
+				data[i] = 'X'
+			}
+			assert.Equal(t, msg, err.Error(), "error message changed after the input buffer was overwritten")
+		})
+	}
+
+	data := []byte(`"SerumkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"`)
+	var pk PublicKey
+	require.NoError(t, pk.UnmarshalJSON(data))
+	for i := range data {
+		data[i] = 'X'
+	}
+	assert.Equal(t, MustPublicKeyFromBase58("SerumkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"), pk)
+}
