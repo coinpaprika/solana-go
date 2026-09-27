@@ -762,3 +762,68 @@ func TestFindProgramAddress_ConcurrentSharedSeedsNoRace(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+// TestPublicKey_UnmarshalJSONMatchesStringDecode pins that the quote-stripping
+// fast path in UnmarshalJSON returns exactly what the json.Unmarshal-then-decode
+// path returns, for both accepted and rejected inputs.
+// unmarshalJSONReference is the pre-fast-path UnmarshalJSON behavior.
+func unmarshalJSONReference(data []byte) (PublicKey, error) {
+	var s string
+	if err := json.Unmarshal(data, &s); err != nil {
+		return PublicKey{}, err
+	}
+	return PublicKeyFromBase58(s)
+}
+
+func TestPublicKey_UnmarshalJSONMatchesStringDecode(t *testing.T) {
+	reference := unmarshalJSONReference
+
+	inputs := []string{
+		`"SerumkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"`,
+		`"11111111111111111111111111111111"`,
+		`"So11111111111111111111111111111111111111112"`,
+		`"SerumkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"`, // escaped 'S': slow path
+		`"SerkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"`,   // wrong length
+		`"0OIl"`, // characters outside the base58 alphabet
+		`""`,     // empty string
+		`null`,   // not a string
+		`12345`,  // not a string
+		`"`,      // truncated
+		`"abc\"`, // escaped quote
+	}
+	for i := 0; i < 256; i++ {
+		inputs = append(inputs, `"`+newUniqueKey().String()+`"`)
+	}
+
+	for _, in := range inputs {
+		t.Run(in, func(t *testing.T) {
+			want, wantErr := reference([]byte(in))
+			var got PublicKey
+			gotErr := got.UnmarshalJSON([]byte(in))
+			if wantErr != nil {
+				assert.Error(t, gotErr)
+				return
+			}
+			require.NoError(t, gotErr)
+			assert.Equal(t, want, got)
+		})
+	}
+}
+
+func FuzzPublicKey_UnmarshalJSON(f *testing.F) {
+	f.Add([]byte(`"SerumkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"`))
+	f.Add([]byte(`"\u0053erumkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"`))
+	f.Add([]byte(`""`))
+	f.Add([]byte(`null`))
+	f.Fuzz(func(t *testing.T, data []byte) {
+		want, wantErr := unmarshalJSONReference(data)
+		var got PublicKey
+		gotErr := got.UnmarshalJSON(data)
+		if (wantErr == nil) != (gotErr == nil) {
+			t.Fatalf("error mismatch on %q: reference=%v fast=%v", data, wantErr, gotErr)
+		}
+		if wantErr == nil && got != want {
+			t.Fatalf("value mismatch on %q", data)
+		}
+	})
+}

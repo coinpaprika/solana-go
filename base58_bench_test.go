@@ -54,3 +54,12 @@ func BenchmarkSignature_MarshalJSON(b *testing.B) {
 		sig.MarshalJSON()
 	}
 }
+
+var benchPubkeyJSON = []byte(`"` + benchPubkeyStr + `"`)
+
+func BenchmarkPublicKey_UnmarshalJSON(b *testing.B) {
+	var pk PublicKey
+	for b.Loop() {
+		_ = pk.UnmarshalJSON(benchPubkeyJSON)
+	}
+}
