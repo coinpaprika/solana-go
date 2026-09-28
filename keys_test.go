@@ -762,3 +762,100 @@ func TestFindProgramAddress_ConcurrentSharedSeedsNoRace(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+// TestPublicKey_UnmarshalJSONMatchesStringDecode pins that the quote-stripping
+// fast path in UnmarshalJSON returns exactly what the json.Unmarshal-then-decode
+// path returns, for both accepted and rejected inputs.
+// unmarshalJSONReference is the pre-fast-path UnmarshalJSON behavior.
+func unmarshalJSONReference(data []byte) (PublicKey, error) {
+	var s string
+	if err := json.Unmarshal(data, &s); err != nil {
+		return PublicKey{}, err
+	}
+	return PublicKeyFromBase58(s)
+}
+
+func TestPublicKey_UnmarshalJSONMatchesStringDecode(t *testing.T) {
+	reference := unmarshalJSONReference
+
+	inputs := []string{
+		`"SerumkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"`,
+		`"11111111111111111111111111111111"`,
+		`"So11111111111111111111111111111111111111112"`,
+		`"SerumkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"`, // escaped 'S': slow path
+		`"SerkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"`,   // wrong length
+		`"0OIl"`, // characters outside the base58 alphabet
+		`""`,     // empty string
+		`null`,   // not a string
+		`12345`,  // not a string
+		`"`,      // truncated
+		`"abc\"`, // escaped quote
+	}
+	for i := 0; i < 256; i++ {
+		inputs = append(inputs, `"`+newUniqueKey().String()+`"`)
+	}
+
+	for _, in := range inputs {
+		t.Run(in, func(t *testing.T) {
+			want, wantErr := reference([]byte(in))
+			var got PublicKey
+			gotErr := got.UnmarshalJSON([]byte(in))
+			if wantErr != nil {
+				assert.Error(t, gotErr)
+				return
+			}
+			require.NoError(t, gotErr)
+			assert.Equal(t, want, got)
+		})
+	}
+}
+
+func FuzzPublicKey_UnmarshalJSON(f *testing.F) {
+	f.Add([]byte(`"SerumkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"`))
+	f.Add([]byte(`"\u0053erumkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"`))
+	f.Add([]byte(`""`))
+	f.Add([]byte(`null`))
+	f.Fuzz(func(t *testing.T, data []byte) {
+		want, wantErr := unmarshalJSONReference(data)
+		var got PublicKey
+		gotErr := got.UnmarshalJSON(data)
+		if (wantErr == nil) != (gotErr == nil) {
+			t.Fatalf("error mismatch on %q: reference=%v fast=%v", data, wantErr, gotErr)
+		}
+		if wantErr == nil && got != want {
+			t.Fatalf("value mismatch on %q", data)
+		}
+	})
+}
+
+// TestPublicKey_UnmarshalJSONDoesNotAliasInput pins the invariant that makes
+// the zero-copy fast path safe: nothing returned by UnmarshalJSON may keep
+// pointing into the caller's buffer, which json.Decoder reuses. A returned
+// error (built from the view) must survive the buffer being overwritten.
+func TestPublicKey_UnmarshalJSONDoesNotAliasInput(t *testing.T) {
+	for _, in := range []string{
+		`"SerkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"`,  // wrong length
+		`"0OIlSerumkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623"`, // outside the alphabet
+	} {
+		t.Run(in, func(t *testing.T) {
+			data := []byte(in)
+			var pk PublicKey
+			err := pk.UnmarshalJSON(data)
+			require.Error(t, err)
+			msg := err.Error()
+
+			for i := range data {
+				data[i] = 'X'
+			}
+			assert.Equal(t, msg, err.Error(), "error message changed after the input buffer was overwritten")
+		})
+	}
+
+	data := []byte(`"SerumkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"`)
+	var pk PublicKey
+	require.NoError(t, pk.UnmarshalJSON(data))
+	for i := range data {
+		data[i] = 'X'
+	}
+	assert.Equal(t, MustPublicKeyFromBase58("SerumkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"), pk)
+}

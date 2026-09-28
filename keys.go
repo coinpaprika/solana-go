@@ -27,6 +27,7 @@ import (
 	"math"
 	"os"
 	"sort"
+	"unsafe"
 
 	"github.com/gagliardetto/solana-go/base58"
 	"github.com/oasisprotocol/curve25519-voi/curve"
@@ -229,6 +230,20 @@ func (p PublicKey) MarshalJSON() ([]byte, error) {
 }
 
 func (p *PublicKey) UnmarshalJSON(data []byte) (err error) {
+	if n := len(data); n >= 2 && data[0] == '"' && data[n-1] == '"' &&
+		bytes.IndexByte(data[1:n-1], '\\') < 0 {
+		// Fast path: base58 has no character JSON escapes, so an unescaped
+		// quoted token is already the string. Skips a nested json.Unmarshal,
+		// which cost more than the base58 decode itself. The string is a
+		// view over data, not a copy: PublicKeyFromBase58 does not retain
+		// its argument, and the error below copies it.
+		*p, err = PublicKeyFromBase58(unsafe.String(&data[1], n-2))
+		if err != nil {
+			return fmt.Errorf("invalid public key %q: %w", string(data[1:n-1]), err)
+		}
+		return nil
+	}
+
 	var s string
 	if err := json.Unmarshal(data, &s); err != nil {
 		return err
